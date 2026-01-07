@@ -73,8 +73,7 @@ src/
   reference/
 
 REDACTED.md
-
-` ``` `
+```
 ---
 
 ## Demo assets (optional)
