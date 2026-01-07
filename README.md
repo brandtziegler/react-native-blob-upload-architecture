@@ -53,19 +53,26 @@ See **`REDACTED.md`** for the full red list.
 
 ---
 
-/docs
-/architecture
-overview.md
-sequence-rn-to-api.md
-/media
-screenshots/
-video/
+## Repository layout
 
-/src
-/domain # DTOs/types used across the pipeline
-/contracts # ports/interfaces (client + server boundaries)
-/application # orchestration (staged upload flow)
-/reference # non-runnable notes and examples
+```text
+docs/
+  architecture/
+    overview.md
+    sequence-rn-to-api.md
+  media/
+    screenshots/
+      placeholder.png
+    video/
+      placeholder.mp4
+
+src/
+  domain/
+  contracts/
+  application/
+  reference/
+
+REDACTED.md
 
 
 ---
