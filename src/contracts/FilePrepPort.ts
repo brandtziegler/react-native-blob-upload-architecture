@@ -1,144 +1,139 @@
 // src/contracts/FilePrepPort.ts
 //
-// Port: turns "discovered files" into "upload-ready files".
-// In your real app this is where you:
-// - classify pdf vs image
-// - compute sizeBytes + contentType
-// - normalize names / enforce .jpg for images
-// - optionally compress images (different profiles for receipts vs part images)
-// - (optionally) consult local DB to decide "receipt vs partImageCompact"
+// Takes the raw file paths found by FileScannerPort and turns them into
+// “upload-ready” descriptors (name/type/size/content-type/etc.).
 //
-// In this portfolio repo, this stays as a contract (interface) + types.
+// This stays pure + testable: no network, no DB, no Azure. Just prep.
 
 import { BlobUploadType } from "../domain/BlobUploadType";
-import { AppError } from "../domain/Errors";
 
-export type FileSourceHint = "pdfFolder" | "partsFolder" | "unknown";
-
-/**
- * Output of FileScannerPort (or anything that "discovers" local files).
- * Keep this minimal: FilePrepPort can enrich it.
- */
-export interface DiscoveredFile {
-  /** Absolute/local device path (Expo FS path or file:// URI). */
+export type PreparedUploadFile = {
+  /** Absolute local path (Expo FileSystem path, or file:// path — your adapter decides) */
   path: string;
 
-  /** Leaf filename as found on disk (may be messy, mixed case, etc.). */
+  /** Original filename from disk (best-effort) */
   originalName: string;
 
-  /** Best-known type at scan time (can be refined during prep). */
-  typeHint?: BlobUploadType;
+  /** Final name that should be used remotely (normalized, extension fixed, etc.) */
+  uploadName: string;
 
-  /** Where we found it (helps debugging + any special rules). */
-  source?: FileSourceHint;
+  /** What bucket/type it maps to in the pipeline */
+  uploadType: BlobUploadType;
+
+  /** Bytes (0 if unknown) */
+  sizeBytes: number;
+
+  /** MIME (application/pdf, image/jpeg, etc.) */
+  contentType: string;
+};
+
+export type FilePrepInput = {
+  /** Local sheet id (handy for logging / name rules) */
+  localSheetId: number;
+
+  /** Paths returned by FileScannerPort */
+  pdfPaths: string[];
+  imagePaths: string[];
 
   /**
-   * Optional parsed IDs from naming convention (e.g., PartUsedID, SheetID).
-   * Real implementation may fill these in during scanning or during prep.
+   * Optional hook to normalize names (e.g., enforce .jpg, sanitize, etc.)
+   * If not provided, we use a conservative default.
    */
-  ids?: Record<string, number>;
-}
-
-/**
- * Upload-ready file:
- * - name is final (normalized)
- * - path may change (after compression)
- * - sizeBytes and contentType are known
- */
-export interface PreparedUploadFile {
-  /** Path to upload from (may be new path after compression). */
-  path: string;
-
-  /** Final blob filename (normalized, extension enforced). */
-  name: string;
-
-  /** 'pdf' | 'partImage' */
-  type: BlobUploadType;
-
-  /** For StartBlobBatch payload + metrics. */
-  sizeBytes?: number;
-
-  /** For blob headers and StartBlobBatch payload. */
-  contentType?: string;
-
-  /** Optional breadcrumbs for debugging / metrics. */
-  meta?: {
+  normalizeName?: (args: {
     originalName: string;
-    source?: FileSourceHint;
-    wasCompressed?: boolean;
-    compressionProfile?: string;
-  };
-}
-
-export interface FilePrepContext {
-  /** Useful for logging and error correlation. */
-  localSheetId?: number;
-
-  /** Optional correlation ID (your batchId/deviceId pattern). */
-  batchId?: string;
-
-  /** Optional logging hook (keep it simple here). */
-  log?: (msg: string, extra?: Record<string, any>) => void;
-}
-
-export interface FilePrepOptions {
-  /**
-   * If true, implementers may compress images.
-   * (In your real code you cap concurrency and use different profiles.)
-   */
-  allowCompression?: boolean;
+    uploadType: BlobUploadType;
+    path: string;
+  }) => Promise<string> | string;
 
   /**
-   * If true, implementers may force all images to .jpg for upload compatibility.
+   * Optional hook to resolve MIME types.
+   * If not provided, we use a minimal default.
    */
-  forceJpegExtension?: boolean;
+  resolveContentType?: (args: {
+    path: string;
+    uploadType: BlobUploadType;
+    name: string;
+  }) => string;
 
   /**
-   * Optional hint for how aggressive prep should be.
-   * - "safe": minimal changes (best for portfolio)
-   * - "production": closer to your real behavior
+   * Optional hook to resolve file sizes.
+   * If not provided, sizeBytes will be 0 (caller can enrich later).
    */
-  mode?: "safe" | "production";
-}
+  resolveSizeBytes?: (path: string) => Promise<number> | number;
+};
 
-export interface FilePrepResult {
+export type FilePrepOk = {
+  ok: true;
   files: PreparedUploadFile[];
-  warnings?: string[];
-}
+  warnings: string[];
+};
+
+export type FilePrepFail = {
+  ok: false;
+  error: {
+    code:
+      | "NO_FILES"
+      | "BAD_INPUT"
+      | "NAME_NORMALIZATION_FAILED"
+      | "SIZE_RESOLUTION_FAILED"
+      | "UNKNOWN";
+    message: string;
+    cause?: unknown;
+  };
+};
+
+export type FilePrepResult = FilePrepOk | FilePrepFail;
 
 export interface FilePrepPort {
-  /**
-   * Prepare a set of discovered files for upload.
-   * Should be deterministic given the same inputs.
-   */
-  prepare(
-    discovered: DiscoveredFile[],
-    ctx?: FilePrepContext,
-    opts?: FilePrepOptions
-  ): Promise<FilePrepResult>;
-
-  /**
-   * Optional single-file API (handy for unit tests and debugging).
-   */
-  prepareOne?(
-    file: DiscoveredFile,
-    ctx?: FilePrepContext,
-    opts?: FilePrepOptions
-  ): Promise<PreparedUploadFile>;
+  prepare(input: FilePrepInput): Promise<FilePrepResult>;
 }
 
 /**
- * Typed error wrapper for prep stage.
- * Keep errors boring and actionable.
+ * Small default helpers (kept here so the port can be used without extra deps).
  */
-export class FilePrepError extends Error implements AppError {
-  readonly kind = "FilePrepError" as const;
+export function defaultNormalizeName(args: {
+  originalName: string;
+  uploadType: BlobUploadType;
+}): string {
+  const name = (args.originalName || "Unknown").trim();
 
-  constructor(
-    message: string,
-    public readonly cause?: unknown,
-    public readonly details?: Record<string, any>
-  ) {
-    super(message);
+  // Keep it conservative: don’t invent semantics here.
+  // Just ensure PDFs end with .pdf and images end with .jpg (if they already look like images).
+  if (args.uploadType === "pdf") {
+    return name.toLowerCase().endsWith(".pdf") ? name : `${stripExt(name)}.pdf`;
   }
+
+  // For images: prefer .jpg for upload compatibility.
+  const lower = name.toLowerCase();
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return ensureJpegExt(name);
+  if (lower.endsWith(".png") || lower.endsWith(".heic") || lower.endsWith(".webp")) {
+    return `${stripExt(name)}.jpg`;
+  }
+  // Unknown extension? Don’t append garbage — leave it as-is.
+  return name;
+}
+
+export function defaultResolveContentType(args: {
+  uploadType: BlobUploadType;
+  name: string;
+}): string {
+  if (args.uploadType === "pdf") return "application/pdf";
+
+  const lower = (args.name || "").toLowerCase();
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+  if (lower.endsWith(".png")) return "image/png";
+  if (lower.endsWith(".webp")) return "image/webp";
+  if (lower.endsWith(".heic")) return "image/heic";
+
+  return "application/octet-stream";
+}
+
+function stripExt(name: string): string {
+  const i = name.lastIndexOf(".");
+  return i > 0 ? name.slice(0, i) : name;
+}
+
+function ensureJpegExt(name: string): string {
+  const base = stripExt(name);
+  return `${base}.jpg`;
 }
