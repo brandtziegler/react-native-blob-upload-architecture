@@ -2,27 +2,43 @@
 
 This repository is a **public architecture showcase** extracted from a private production codebase.
 
-It is **intentionally non-runnable**.
+It demonstrates a staged “direct-to-Blob” batch upload flow from a React Native client:
 
-The goal is to demonstrate:
-- clear **module boundaries**
-- clean **contracts (ports/interfaces)**
-- stable **domain DTOs/types**
-- a practical staged upload flow: **Scan → Prep → StartBatch → Upload → Finalize → PostProcess**
-- how the app keeps a simple **UploadStage** state machine while the heavy lifting is offloaded
+**Scan → Prep → StartBatch → Upload → Finalize → EnqueuePostProcessing**
 
-✅ You get the *shape* of the system (interfaces, orchestration, types).  
-🚫 You do NOT get production secrets (real endpoints, auth, customer folder semantics, proprietary rules).
+This repo is intentionally **non-runnable**:
+- no real endpoints / production URLs
+- no secrets / keys / tokens
+- no proprietary folder semantics or customer identifiers
+- no device-specific wiring (Expo FS, RN Background Upload, etc.)
+- no real PDFs/images included
 
-See `REDACTED.md` for what was intentionally omitted.
+See **`REDACTED.md`** for the full “red list” of what is intentionally omitted.
+
+---
+
+## What this repo is showing
+
+### The pipeline (conceptual)
+1. **Scan local device** for PDFs + part images (client-side file enumeration)
+2. **Prep files** (naming/normalization/compression in the real app; abstracted here)
+3. **StartBlobBatch** (client asks API for an upload plan; API returns SAS URLs + recommended parallelism)
+4. **Upload** (client uploads bytes directly to Azure Blob via SAS URLs; bounded concurrency)
+5. **FinalizeBlobBatch** (client asks API to verify planned blobs exist; server returns counts + any failures)
+6. **EnqueueBlobPostProcessing** (API enqueues async work: Drive sync / receipts parse / email / etc.)
+
+### Where to look first
+- `docs/architecture/overview.md` — narrative overview + boundaries
+- `docs/architecture/sequence-rn-to-api.md` — sequence-style walk-through (RN ↔ API)
+- `src/application/UploadOrchestrator.ts` — the “story” of the pipeline in code form
+- `src/contracts/*` — ports/interfaces (clean boundaries)
+- `src/domain/*` — stable DTOs + enums + error model
 
 ---
 
 ## Repository layout
 
-> “Fenced block” just means a code block wrapped in triple backticks.
-
-```txt
+```text
 docs/
   architecture/
     overview.md
@@ -35,7 +51,7 @@ docs/
 
 src/
   domain/
-    BlobUploadType.ts
+    BlobUploadTypes.ts
     UploadStage.ts
     Errors.ts
 
@@ -51,6 +67,6 @@ src/
     UploadOrchestrator.ts
     SendToCloudController.ts
 
-REDACTED.md
 README.md
+REDACTED.md
 ```
