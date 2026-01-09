@@ -1,113 +1,152 @@
-// src/domain/Errors.ts
 /**
- * Error model for the non-runnable upload architecture repo.
- * Keep it boring, typed, and easy to map to UI messages.
+ * src/domain/Errors.ts
+ *
+ * A small error model used by the architecture demo.
+ * Keep it strict enough for logging + UI, but simple enough to map from your app.
  */
 
-import type { UploadStage } from "./UploadStage";
+import { UploadStage } from "./UploadStage";
 
-export type ErrorCode =
-  | "NO_INTERNET"
-  | "START_BATCH_FAILED"
-  | "UPLOAD_PUT_FAILED"
-  | "FINALIZE_FAILED"
-  | "ENQUEUE_FAILED"
-  | "INVALID_INPUT"
-  | "TIMEOUT"
-  | "CANCELLED"
-  | "UNKNOWN";
+export const UploadErrorCode = {
+  // generic / infrastructure
+  NoInternet: "NoInternet",
+  Cancelled: "Cancelled",
+  Timeout: "Timeout",
+  InvalidInput: "InvalidInput",
 
-/** A safe, serializable error shape (good for logs + persistence). */
-export type UploadError = {
-  code: ErrorCode;
-  stage: UploadStage;
-  message: string;
+  // pipeline phases
+  ScanFailed: "ScanFailed",
+  PrepFailed: "PrepFailed",
+  StartFailed: "StartFailed",
+  MissingUploadPlan: "MissingUploadPlan",
+  PutFailed: "PutFailed",
+  FinalizeFailed: "FinalizeFailed",
+  FinalizeMismatch: "FinalizeMismatch",
+  EnqueueFailed: "EnqueueFailed",
 
-  /** Optional machine-friendly details (never secrets). */
-  details?: Record<string, unknown>;
+  // catch-all
+  Unexpected: "Unexpected",
+} as const;
 
-  /** Optional file name involved (no full paths). */
-  fileName?: string;
+export type UploadErrorCode = (typeof UploadErrorCode)[keyof typeof UploadErrorCode];
 
-  /** Useful for retry decisions. */
-  retryable?: boolean;
+export type UploadErrorMeta = Record<string, unknown>;
 
-  /** Optional HTTP-ish info when errors come from network calls. */
-  http?: {
-    status?: number;
-    endpoint?: string; // keep generic; do not store real domains
-  };
+export class UploadError extends Error {
+  public readonly code: UploadErrorCode;
+  public readonly stage: UploadStage;
+  public readonly meta?: UploadErrorMeta;
+  public readonly retryable: boolean;
+  public readonly nowMs: number;
 
-  /** Timestamp for local tracker rows. */
-  atMs?: number;
+  constructor(
+    code: UploadErrorCode,
+    message: string,
+    opts?: {
+      stage?: UploadStage;
+      meta?: UploadErrorMeta;
+      retryable?: boolean;
+      nowMs?: number;
+      cause?: unknown;
+    },
+  ) {
+    super(message);
+    this.name = "UploadError";
+    this.code = code;
+    this.stage = opts?.stage ?? UploadStage.Failure;
+    this.meta = opts?.meta;
+    this.retryable = opts?.retryable ?? isRetryable(code);
+    this.nowMs = opts?.nowMs ?? Date.now();
+
+    // Keep the original error available for debugging (Node / RN supported).
+    // @ts-expect-error - TS lib differences
+    if (opts?.cause !== undefined) this.cause = opts.cause;
+  }
+}
+
+export type RetryPolicy = {
+  maxAttempts: number; // total attempts (including first)
+  baseDelayMs: number; // e.g. 500
+  maxDelayMs: number; // e.g. 8000
+  jitterMs: number; // e.g. 200
 };
 
-export function nowMs(): number {
-  return Date.now();
-}
+export const defaultRetryPolicy: RetryPolicy = {
+  maxAttempts: 3,
+  baseDelayMs: 500,
+  maxDelayMs: 8000,
+  jitterMs: 200,
+};
 
 export function makeError(
-  code: ErrorCode,
-  stage: UploadStage,
+  code: UploadErrorCode,
   message: string,
-  extras?: Partial<Omit<UploadError, "code" | "stage" | "message">>
+  opts?: {
+    stage?: UploadStage;
+    meta?: UploadErrorMeta;
+    retryable?: boolean;
+    cause?: unknown;
+  },
 ): UploadError {
-  return {
-    code,
-    stage,
-    message,
-    atMs: nowMs(),
-    ...extras,
-  };
+  return new UploadError(code, message, {
+    stage: opts?.stage,
+    meta: opts?.meta,
+    retryable: opts?.retryable,
+    cause: opts?.cause,
+  });
 }
 
-/** Converts unknown thrown values into a safe UploadError. */
 export function fromUnknown(
-  stage: UploadStage,
   err: unknown,
-  fallbackCode: ErrorCode = "UNKNOWN"
+  fallbackCode: UploadErrorCode = UploadErrorCode.Unexpected,
+  opts?: { stage?: UploadStage; meta?: UploadErrorMeta },
 ): UploadError {
-  if (err && typeof err === "object") {
-    const anyErr = err as any;
-    const msg =
-      typeof anyErr.message === "string"
-        ? anyErr.message
-        : typeof anyErr.toString === "function"
-          ? String(anyErr.toString())
-          : "Unexpected error";
-    return makeError(fallbackCode, stage, msg);
+  if (err instanceof UploadError) return err;
+
+  const message =
+    err instanceof Error
+      ? err.message
+      : typeof err === "string"
+        ? err
+        : "Unexpected error";
+
+  return makeError(fallbackCode, message, {
+    stage: opts?.stage ?? UploadStage.Failure,
+    meta: opts?.meta,
+    cause: err,
+  });
+}
+
+export function isRetryable(code: UploadErrorCode): boolean {
+  switch (code) {
+    case UploadErrorCode.NoInternet:
+    case UploadErrorCode.Timeout:
+    case UploadErrorCode.PutFailed:
+    case UploadErrorCode.StartFailed:
+    case UploadErrorCode.FinalizeFailed:
+    case UploadErrorCode.EnqueueFailed:
+    case UploadErrorCode.Unexpected:
+      return true;
+
+    case UploadErrorCode.Cancelled:
+    case UploadErrorCode.InvalidInput:
+    case UploadErrorCode.MissingUploadPlan:
+    case UploadErrorCode.FinalizeMismatch:
+    case UploadErrorCode.ScanFailed:
+    case UploadErrorCode.PrepFailed:
+    default:
+      return false;
   }
-  return makeError(fallbackCode, stage, String(err ?? "Unexpected error"));
 }
 
-/**
- * Simple retry policy helper used by stubs.
- * Keep the logic generic; real production tuning is redacted.
- */
-export function isRetryable(e: UploadError): boolean {
-  if (e.retryable === true) return true;
-  if (e.code === "NO_INTERNET") return false;
-  if (e.code === "INVALID_INPUT") return false;
-  if (e.code === "CANCELLED") return false;
-
-  const status = e.http?.status;
-  if (typeof status === "number") {
-    // Typical transient statuses
-    if (status === 408 || status === 429) return true;
-    if (status >= 500 && status <= 599) return true;
-    // Otherwise: assume not retryable unless explicitly marked
-    return false;
-  }
-
-  // Default conservative choice for unknown failures
-  return e.code !== "FINALIZE_FAILED";
+export function shouldRetry(err: UploadError, attempt: number, policy: RetryPolicy = defaultRetryPolicy): boolean {
+  if (!err.retryable) return false;
+  return attempt < policy.maxAttempts;
 }
 
-/** Backoff helper (publishable). */
-export function backoffMs(attempt: number, baseMs = 500, maxMs = 8_000): number {
-  const pow = Math.min(maxMs, baseMs * Math.pow(2, Math.max(0, attempt - 1)));
-  // small jitter
-  const jitter = Math.floor(Math.random() * 150);
-  return Math.min(maxMs, pow + jitter);
+export function computeBackoffMs(attempt: number, policy: RetryPolicy = defaultRetryPolicy): number {
+  const raw = policy.baseDelayMs * Math.pow(2, Math.max(0, attempt - 1));
+  const clamped = Math.min(raw, policy.maxDelayMs);
+  const jitter = Math.floor(Math.random() * policy.jitterMs);
+  return clamped + jitter;
 }
-
