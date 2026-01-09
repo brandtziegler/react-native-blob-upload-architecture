@@ -23,7 +23,7 @@
 import { UploadStage } from "../domain/UploadStage";
 import { UploadError, UploadErrorCode } from "../domain/Errors";
 
-import type { BlobUploadType } from "../domain/BlobUploadTypes";
+import type { UploadFileType } from "../domain/BlobUploadTypes";
 
 import type { BlobBatchApiPort } from "../contracts/BlobBatchApiPort";
 import type { BlobUploaderPort } from "../contracts/BlobUploaderPort";
@@ -39,7 +39,7 @@ import type { LoggerPort } from "../contracts/LoggerPort";
 export type UploadFile = {
   path: string;          // device path (or placeholder in this repo)
   name: string;          // filename only
-  type: BlobUploadType;  // "pdf" | "partImage"
+  type: UploadFileType;  // "pdf" | "partImage"
   sizeBytes?: number;
   contentType?: string;
 };
