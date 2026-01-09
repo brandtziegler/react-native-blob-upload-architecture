@@ -3,13 +3,17 @@
 // Purpose:
 // - UI-facing controller that runs the staged upload flow via UploadOrchestrator
 // - Emits stage + status updates (mirrors your "controller.step('Init') / fail() / complete()" vibe)
-// - Supports cancellation (AbortSignal) and single-flight safety
+// - Supports cancellation (best-effort) and single-flight safety
 //
 // Non-runnable by design. This repo is an architecture artifact, not your full app.
 
 import { UploadStage } from "../domain/UploadStage";
-import { UploadError } from "../domain/Errors";
-import type { UploadOrchestrator } from "./UploadOrchestrator";
+import { UploadError, UploadErrorCode } from "../domain/Errors";
+import type {
+  UploadOrchestrator,
+  UploadOrchestratorInput,
+  UploadOrchestratorResult,
+} from "./UploadOrchestrator";
 
 export type UploadStatus = "idle" | "running" | "success" | "failure" | "cancelled";
 
@@ -31,20 +35,19 @@ export type SendToCloudRequest = {
 
 export type SendToCloudResult = {
   status: UploadStatus;
-  finalStage: UploadStage;
+  finalStage: (typeof UploadStage)[keyof typeof UploadStage];
   remoteSheetId?: number | null;
   message?: string;
   error?: UploadError | null;
 };
 
 type Unsubscribe = () => void;
-
 type Listener<T> = (value: T) => void;
 
 function asUploadError(err: unknown): UploadError {
   if (err instanceof UploadError) return err;
-  const msg = err instanceof Error ? err.message : String(err);
-  return new UploadError("UNEXPECTED", msg);
+  const message = err instanceof Error ? err.message : String(err);
+  return new UploadError(UploadErrorCode.Unexpected, message);
 }
 
 /**
@@ -57,10 +60,10 @@ export class SendToCloudController {
   private readonly orchestrator: UploadOrchestrator;
 
   private status: UploadStatus = "idle";
-  private stage: UploadStage = UploadStage.PreInit;
+  private stage: (typeof UploadStage)[keyof typeof UploadStage] = UploadStage.Init;
 
   private statusListeners = new Set<Listener<UploadStatus>>();
-  private stageListeners = new Set<Listener<UploadStage>>();
+  private stageListeners = new Set<Listener<(typeof UploadStage)[keyof typeof UploadStage]>>();
   private messageListeners = new Set<Listener<string>>();
 
   private inflight: Promise<SendToCloudResult> | null = null;
@@ -78,7 +81,7 @@ export class SendToCloudController {
     return () => this.statusListeners.delete(fn);
   }
 
-  onStage(fn: Listener<UploadStage>): Unsubscribe {
+  onStage(fn: Listener<(typeof UploadStage)[keyof typeof UploadStage]>): Unsubscribe {
     this.stageListeners.add(fn);
     fn(this.stage);
     return () => this.stageListeners.delete(fn);
@@ -95,7 +98,7 @@ export class SendToCloudController {
     return this.status;
   }
 
-  getStage(): UploadStage {
+  getStage(): (typeof UploadStage)[keyof typeof UploadStage] {
     return this.stage;
   }
 
@@ -104,13 +107,71 @@ export class SendToCloudController {
     for (const fn of this.statusListeners) fn(next);
   }
 
-  private setStage(next: UploadStage) {
+  private setStage(next: (typeof UploadStage)[keyof typeof UploadStage]) {
     this.stage = next;
     for (const fn of this.stageListeners) fn(next);
   }
 
   private say(msg: string) {
     for (const fn of this.messageListeners) fn(msg);
+  }
+
+  private makeBatchId(req: SendToCloudRequest): string {
+    // In your real app: stableDeviceId (or deviceId + workOrderId).
+    // For this repo artifact: deterministic, non-secret.
+    return `batch_local_${req.localSheetId}`;
+  }
+
+  private makeWorkOrderId(req: SendToCloudRequest): string {
+    // Prefer true WO# if provided; otherwise fall back to remoteSheetId then localSheetId.
+    const wo =
+      req.remoteWorkOrderNumber ??
+      req.remoteSheetId ??
+      req.localSheetId;
+
+    return String(wo);
+  }
+
+  private buildOrchestratorInput(req: SendToCloudRequest, signal: AbortSignal): UploadOrchestratorInput {
+    const custPath = req.customerPathToRoot ?? "";
+    if (!custPath) {
+      throw new UploadError(
+        UploadErrorCode.InvalidInput,
+        "Missing customerPathToRoot (custPath) required for blob/Drive semantics."
+      );
+    }
+
+    const input: UploadOrchestratorInput = {
+      batchId: this.makeBatchId(req),
+      testPrefix: "uploadFromArtifact",
+      workOrderId: this.makeWorkOrderId(req),
+
+      remoteSheetId: req.remoteSheetId ?? undefined,
+      localSheetId: req.localSheetId,
+
+      custPath,
+
+      // Optional: the architecture repo keeps these as optional
+      workOrderFolderId: undefined,
+      pdfFolderId: undefined,
+      imagesFolderId: undefined,
+
+      // Optional scanning hints (the FileScannerPort decides what to do with these)
+      pdfFolderPath: undefined,
+      imageFolderPath: undefined,
+
+      clientParallelismHint: 8,
+
+      onStage: (s) => {
+        // Best-effort cancellation: if UI aborts, throw to unwind the orchestrator.
+        if (signal.aborted) {
+          throw new Error("Cancelled");
+        }
+        this.step(s, `Stage: ${String(s)}`);
+      },
+    };
+
+    return input;
   }
 
   // --- public API ------------------------------------------------------------
@@ -126,29 +187,45 @@ export class SendToCloudController {
     const signal = this.aborter.signal;
 
     this.setStatus("running");
-    this.setStage(UploadStage.PreInit);
+    this.setStage(UploadStage.Init);
     this.say("Starting upload…");
 
     this.inflight = (async (): Promise<SendToCloudResult> => {
       try {
-        const result = await this.orchestrator.run(req, {
-          signal,
-          onStage: (s) => {
-            this.setStage(s);
-            this.say(`Stage: ${String(s)}`);
-          },
-          onNote: (m) => this.say(m),
-        });
+        const orchInput = this.buildOrchestratorInput(req, signal);
 
-        // Orchestrator decides whether "Done" means success.
-        this.setStage(result.finalStage);
-        this.setStatus(result.status);
+        const result: UploadOrchestratorResult = await this.orchestrator.run(orchInput);
 
-        if (result.status === "success") this.say("Upload complete.");
-        if (result.status === "cancelled") this.say("Upload cancelled.");
-        if (result.status === "failure") this.say("Upload failed.");
+        // If the user cancelled, treat it as cancelled regardless of orchestrator outcome.
+        if (signal.aborted) {
+          const out: SendToCloudResult = {
+            status: "cancelled",
+            finalStage: this.stage,
+            remoteSheetId: req.remoteSheetId ?? null,
+            message: "Cancelled",
+            error: null,
+          };
+          this.setStatus("cancelled");
+          this.say("Upload cancelled.");
+          return out;
+        }
 
-        return result;
+        const status: UploadStatus = result.ok ? "success" : "failure";
+        const out: SendToCloudResult = {
+          status,
+          finalStage: result.stage,
+          remoteSheetId: req.remoteSheetId ?? null,
+          message: result.ok ? "Upload complete." : "Upload failed.",
+          error: null,
+        };
+
+        this.setStage(result.stage);
+        this.setStatus(status);
+
+        if (status === "success") this.say("Upload complete.");
+        else this.say("Upload failed.");
+
+        return out;
       } catch (err: unknown) {
         // Cancellation is treated as cancelled if abort was requested
         if (signal.aborted) {
@@ -160,10 +237,12 @@ export class SendToCloudController {
             error: null,
           };
           this.setStatus("cancelled");
+          this.say("Upload cancelled.");
           return out;
         }
 
         const upErr = asUploadError(err);
+
         const out: SendToCloudResult = {
           status: "failure",
           finalStage: this.stage,
@@ -171,7 +250,8 @@ export class SendToCloudController {
           message: upErr.message,
           error: upErr,
         };
-        this.setStatus("failure");
+
+        this.fail(`Upload failed — ${upErr.message}`);
         return out;
       } finally {
         // reset single-flight latch
@@ -189,34 +269,34 @@ export class SendToCloudController {
   cancel(reason = "User cancelled") {
     if (!this.aborter) return;
     this.say(reason);
+    this.setStatus("cancelled"); // optimistic UI; promise path will finalize
     this.aborter.abort();
-    // status will be resolved by the promise catch/finally path
   }
 
   /**
-   * Convenience helpers if you want a “step/fail/complete” vibe like your existing controller.
-   * These are NOT used by orchestrator; they’re here to match the mental model.
+   * Convenience helpers (matches your controller mental model).
+   * These are NOT required by the orchestrator; they're for UI ergonomics.
    */
-  step(label: "Init" | "Folder" | "Upload" | "Finalize") {
-    // map your labels to UploadStage
-    const map: Record<typeof label, UploadStage> = {
-      Init: UploadStage.Init,
-      Folder: UploadStage.Folder,
-      Upload: UploadStage.Upload,
-      Finalize: UploadStage.Finalize,
-    };
-    this.setStage(map[label]);
-    this.say(`Step: ${label}`);
+  step(stage: (typeof UploadStage)[keyof typeof UploadStage], message?: string) {
+    this.setStage(stage);
+    if (message) this.say(message);
   }
 
-  fail(message: string) {
+  fail(reason: string) {
     this.setStatus("failure");
-    this.say(message);
+    this.setStage(UploadStage.Failure);
+    this.say(reason);
   }
 
   complete() {
     this.setStatus("success");
-    this.setStage(UploadStage.Done);
+    this.setStage(UploadStage.Complete);
     this.say("Complete.");
   }
+
+  reset() {
+    this.setStage(UploadStage.Init);
+    this.setStatus("idle");
+  }
 }
+
