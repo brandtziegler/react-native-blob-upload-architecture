@@ -1,102 +1,116 @@
-// src/domain/UploadStage.ts
 /**
- * Upload stage tracking for the RN → API → Blob → API pipeline.
- * This is intentionally generic (non-runnable) and safe to publish.
+ * src/domain/UploadStage.ts
+ *
+ * A tiny, boring stage model for the pipeline:
+ *   Scan -> Prep -> Start -> Upload -> Finalize -> Enqueue -> Complete
+ *
+ * (Keep it generic so you can map your real app's richer stages onto it.)
  */
 
-export type UploadStage =
-  | "Preflight"
-  | "Init"
-  | "Plan"
-  | "Upload"
-  | "Finalize"
-  | "Enqueue"
-  | "Complete"
-  | "Failure";
+export const UploadStage = {
+  Init: "Init",
+  Scan: "Scan",
+  Prep: "Prep",
+  Start: "Start",
+  Upload: "Upload",
+  Finalize: "Finalize",
+  Enqueue: "Enqueue",
+  Complete: "Complete",
+  Failure: "Failure",
+} as const;
 
-/**
- * A simple status snapshot that can be persisted locally (SQLite) or held in memory.
- * Mirrors the “4 icon” style trackers (Init/Folder/Files/Finalize) while staying generic.
- */
+export type UploadStage = (typeof UploadStage)[keyof typeof UploadStage];
+
+export type UploadStatus = "idle" | "running" | "success" | "failure" | "cancelled";
+
 export type UploadStageFlags = {
-  uploadInitComplete: 0 | 1;
-  uploadPlanComplete: 0 | 1;
-  uploadFilesUploaded: 0 | 1;
-  uploadDbFinalized: 0 | 1;
-  /** Optional: enqueue/post-processing acknowledgement */
-  uploadEnqueued?: 0 | 1;
+  initComplete: 0 | 1;
+  scanComplete: 0 | 1;
+  prepComplete: 0 | 1;
+  startComplete: 0 | 1;
+  uploadComplete: 0 | 1;
+  finalizeComplete: 0 | 1;
+  enqueueComplete: 0 | 1;
+  complete: 0 | 1;
+  failedReason: string;
 };
 
-/** High-level status string (fits UI + logs). */
-export type UploadStatus = "idle" | "running" | "success" | "failure";
-
-/**
- * Event emitted by the orchestrator so UI can update progress.
- * Keep it small and stable: stage + optional message + optional counts.
- */
 export type UploadProgressEvent = {
-  status: UploadStatus;
   stage: UploadStage;
+  status: UploadStatus;
   message?: string;
-
-  /** Optional progress numbers for uploads */
-  plannedCount?: number;
-  uploadedCount?: number;
-  failedCount?: number;
+  nowMs?: number;
 };
 
-/**
- * Minimal controller interface the orchestrator can call.
- * (In the private codebase this may connect to UI, toasts, and/or persistence.)
- */
 export interface UploadController {
-  /** Sets the current step/stage. */
-  step(stage: Exclude<UploadStage, "Complete" | "Failure">, message?: string): void;
+  /** Move forward one stage. (Pure UI state; real work should already have happened.) */
+  step(stage: UploadStage, message?: string): void;
 
-  /** Marks completion. */
+  /** Mark success. */
   complete(message?: string): void;
 
-  /** Marks failure with a user-facing reason. */
+  /** Mark failure and store a reason. */
   fail(reason: string): void;
 
-  /** Optional: emit detailed progress events. */
+  /** Optional event hook for UI/telemetry. */
   emit?(evt: UploadProgressEvent): void;
 }
 
-/**
- * Helper: convert a stage to flags (useful when writing a local tracker row).
- * Adjust to match your UI icon set without leaking private semantics.
- */
-export function stageToFlags(stage: UploadStage): UploadStageFlags {
-  return {
-    uploadInitComplete: stageRank(stage) >= stageRank("Init") ? 1 : 0,
-    uploadPlanComplete: stageRank(stage) >= stageRank("Plan") ? 1 : 0,
-    uploadFilesUploaded: stageRank(stage) >= stageRank("Upload") ? 1 : 0,
-    uploadDbFinalized: stageRank(stage) >= stageRank("Finalize") ? 1 : 0,
-    uploadEnqueued: stageRank(stage) >= stageRank("Enqueue") ? 1 : 0,
-  };
-}
-
-function stageRank(stage: UploadStage): number {
+function stageOrder(stage: UploadStage): number {
   switch (stage) {
-    case "Preflight":
+    case UploadStage.Init:
       return 0;
-    case "Init":
+    case UploadStage.Scan:
       return 1;
-    case "Plan":
+    case UploadStage.Prep:
       return 2;
-    case "Upload":
+    case UploadStage.Start:
       return 3;
-    case "Finalize":
+    case UploadStage.Upload:
       return 4;
-    case "Enqueue":
+    case UploadStage.Finalize:
       return 5;
-    case "Complete":
+    case UploadStage.Enqueue:
       return 6;
-    case "Failure":
-      return -1;
+    case UploadStage.Complete:
+      return 7;
+    case UploadStage.Failure:
     default:
-      // exhaustive guard
       return -1;
   }
+}
+
+/**
+ * Converts a stage into "done flags" you can store (SQLite, etc).
+ * Flags are cumulative (everything up to the current stage is marked complete).
+ */
+export function stageToFlags(stage: UploadStage, failedReason = ""): UploadStageFlags {
+  const s = stageOrder(stage);
+
+  // Failure is special: keep flags simple and attach the reason.
+  if (stage === UploadStage.Failure) {
+    return {
+      initComplete: 0,
+      scanComplete: 0,
+      prepComplete: 0,
+      startComplete: 0,
+      uploadComplete: 0,
+      finalizeComplete: 0,
+      enqueueComplete: 0,
+      complete: 0,
+      failedReason: failedReason || "Upload failed.",
+    };
+  }
+
+  return {
+    initComplete: s >= 0 ? 1 : 0,
+    scanComplete: s >= 1 ? 1 : 0,
+    prepComplete: s >= 2 ? 1 : 0,
+    startComplete: s >= 3 ? 1 : 0,
+    uploadComplete: s >= 4 ? 1 : 0,
+    finalizeComplete: s >= 5 ? 1 : 0,
+    enqueueComplete: s >= 6 ? 1 : 0,
+    complete: s >= 7 ? 1 : 0,
+    failedReason: "",
+  };
 }
