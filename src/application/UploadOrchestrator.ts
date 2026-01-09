@@ -3,21 +3,21 @@
  *
  * NON-RUNNABLE ARCHITECTURE ARTIFACT
  * ---------------------------------
- * This orchestrator mirrors the real-world flow you described:
+ * Mirrors the high-level flow:
  *
  *   1) Scan local device for PDFs + part images
- *   2) Prep files (normalization/compression naming in real app)
+ *   2) Prep files (normalize/compress/rename in the real app)
  *   3) StartBlobBatch (server returns SAS URLs + recommended parallelism)
  *   4) Upload to Azure Blob via SAS (bounded parallelism)
  *   5) FinalizeBlobBatch (server verifies presence)
  *   6) EnqueueBlobPostProcessing (Drive sync + receipts parse/email)
  *
- * This is intentionally "clean-room" and non-runnable:
+ * Clean-room + intentionally non-runnable:
  * - no Expo FS
- * - no RN Background Upload
+ * - no RN background upload
  * - no secrets / real endpoints
  *
- * The goal: make the boundaries obvious and auditable.
+ * The goal is to make boundaries obvious and auditable.
  */
 
 import { UploadStage } from "../domain/UploadStage";
@@ -25,63 +25,32 @@ import { UploadError, UploadErrorCode } from "../domain/Errors";
 
 import type { UploadFileType } from "../domain/BlobUploadTypes";
 
-import type { BlobBatchApiPort } from "../contracts/BlobBatchApiPort";
+import type { BlobBatchApiPort, ApiResult } from "../contracts/BlobBatchApiPort";
 import type { BlobUploaderPort } from "../contracts/BlobUploaderPort";
 import type { FileScannerPort } from "../contracts/FileScannerPort";
 import type { FilePrepPort } from "../contracts/FilePrepPort";
 import type { ClockPort } from "../contracts/ClockPort";
 import type { LoggerPort } from "../contracts/LoggerPort";
 
+import type { UploadStage as UploadStageT } from "../domain/UploadStage";
+import type { SendToCloudResult, SendToCloudRequest } from "./SendToCloudController";
+
 /**
  * Minimal “file record” that flows through the pipeline.
- * Your concrete impls can carry more fields (hashes, local IDs, etc).
+ * Concrete impls can carry more fields (hashes, local IDs, etc).
  */
 export type UploadFile = {
-  path: string;          // device path (or placeholder in this repo)
-  name: string;          // filename only
-  type: UploadFileType;  // "pdf" | "partImage"
+  path: string; // device path (or placeholder in this repo)
+  name: string; // filename only
+  type: UploadFileType; // "pdf" | "partImage"
   sizeBytes?: number;
   contentType?: string;
 };
 
-export type UploadOrchestratorInput = {
-  // identity / audit
-  batchId: string;                 // in your real flow: stableDeviceId
-  testPrefix?: string;             // e.g. "uploadFromApp"
-  workOrderId: string;             // stringified WO#
-  remoteSheetId?: number;          // optional for logging
-  localSheetId?: number;           // optional for logging
-
-  // folder semantics (Drive metadata that server will use downstream)
-  custPath: string;
-  workOrderFolderId?: string;
-  pdfFolderId?: string;
-  imagesFolderId?: string;
-
-  // scanning locations (placeholders here; real impl decides)
-  pdfFolderPath?: string;
-  imageFolderPath?: string;
-
-  // tuning knobs
-  clientParallelismHint?: number;  // you send 8; server clamps and returns recommendedParallelism
-  batchSizeHint?: number;          // if you want deterministic chunking for docs/tests
-
-  // hooks
-  onStage?: (stage: UploadStage) => void;
-};
-
-export type UploadOrchestratorResult = {
-  ok: boolean;
-  stage: UploadStage;
-  startedAtMs: number;
-  finishedAtMs: number;
-  timingsMs: Record<string, number>;
-  counts: {
-    scanned: number;
-    planned: number;
-    uploaded: number;
-  };
-  warnings: string[];
+export type UploadOrchestratorOptions = {
+  signal?: AbortSignal;
+  onStage?: (stage: UploadStageT) => void;
+  onNote?: (note: string) => void;
 };
 
 type Deps = {
@@ -98,215 +67,294 @@ export class UploadOrchestrator {
 
   /**
    * Run the pipeline once.
-   * Any “retry policy” beyond bounded upload retries should live *above* this
-   * (e.g., controller/UI), so the orchestrator stays deterministic.
+   * “Retry policy” beyond bounded per-file upload retries should live above this
+   * (controller/UI), so this stays deterministic and auditable.
    */
-  async run(input: UploadOrchestratorInput): Promise<UploadOrchestratorResult> {
+  async run(
+    req: SendToCloudRequest,
+    opts: UploadOrchestratorOptions = {}
+  ): Promise<SendToCloudResult> {
     const { clock, logger } = this.deps;
 
+    const signal = opts.signal;
+    const notes: string[] = [];
+
+    const note = (msg: string) => {
+      notes.push(msg);
+      opts.onNote?.(msg);
+    };
+
+    const setStage = (s: UploadStageT) => {
+      opts.onStage?.(s);
+    };
+
     const startedAtMs = clock.nowMs();
-    const timingsMs: Record<string, number> = {};
-    const warnings: string[] = [];
+    let stage: UploadStageT = UploadStage.PreInit;
 
-    let stage: UploadStage = UploadStage.Init;
-    input.onStage?.(stage);
-
-    let scanned: UploadFile[] = [];
-    let plannedCount = 0;
-    let uploadedCount = 0;
+    const logBase = {
+      workOrderId: req.workOrderId,
+      batchId: req.batchId,
+      remoteSheetId: req.remoteSheetId ?? undefined,
+      testPrefix: req.testPrefix ?? undefined,
+      custPath: req.custPath,
+    };
 
     try {
       // ----------------------
+      // 0) Validate
+      // ----------------------
+      assertNotAborted(signal);
+
+      stage = UploadStage.Init;
+      setStage(stage);
+
+      if (!req.workOrderId?.trim()) {
+        throw new UploadError(UploadErrorCode.ValidationFailed, "Missing workOrderId.");
+      }
+      if (!req.batchId?.trim()) {
+        throw new UploadError(UploadErrorCode.ValidationFailed, "Missing batchId.");
+      }
+      if (!req.custPath?.trim()) {
+        throw new UploadError(UploadErrorCode.ValidationFailed, "Missing custPath.");
+      }
+
+      // This repo assumes folder semantics are already known (created upstream).
+      // We still call out when IDs are missing, because the server-side post-processor will care.
+      stage = UploadStage.Folder;
+      setStage(stage);
+
+      if (!req.workOrderFolderId) note("workOrderFolderId not provided (ok for artifact; server may require in real flow).");
+      if (!req.pdfFolderId) note("pdfFolderId not provided (ok for artifact; server may require in real flow).");
+      if (!req.imagesFolderId) note("imagesFolderId not provided (ok for artifact; server may require in real flow).");
+
+      // ----------------------
       // 1) Scan
       // ----------------------
+      assertNotAborted(signal);
+
       stage = UploadStage.Scan;
-      input.onStage?.(stage);
+      setStage(stage);
 
       const tScan0 = clock.nowMs();
-      scanned = await this.deps.fileScanner.scan({
-        pdfFolderPath: input.pdfFolderPath,
-        imageFolderPath: input.imageFolderPath,
+      const scanned = await this.deps.fileScanner.scan({
+        pdfFolderPath: req.pdfFolderPath,
+        imageFolderPath: req.imageFolderPath,
       });
-      timingsMs.scan = clock.nowMs() - tScan0;
+      note(`Scan: found ${scanned.length} file(s) in ${clock.nowMs() - tScan0}ms.`);
 
       if (!scanned.length) {
-        // This matches your real flow: early exit with “nothing to upload”
-        logger.info("[UploadOrchestrator] No files found to upload.");
+        // Matches your real flow: early exit with “nothing to upload”
         return {
-          ok: true,
-          stage,
-          startedAtMs,
-          finishedAtMs: clock.nowMs(),
-          timingsMs,
-          counts: { scanned: 0, planned: 0, uploaded: 0 },
-          warnings,
+          status: "success",
+          finalStage: UploadStage.Done,
+          notes,
+          message: "No files found to upload.",
+          remoteSheetId: req.remoteSheetId ?? null,
         };
       }
 
       // ----------------------
-      // 2) Prep (normalize/compress/etc in real impl)
+      // 2) Prep
       // ----------------------
+      assertNotAborted(signal);
+
       stage = UploadStage.Prep;
-      input.onStage?.(stage);
+      setStage(stage);
 
       const tPrep0 = clock.nowMs();
-      const prepared = await this.deps.filePrep.prepare(scanned, {
-        // optional contextual knobs
-        workOrderId: input.workOrderId,
-        custPath: input.custPath,
+      const prepared: UploadFile[] = await this.deps.filePrep.prepare(scanned, {
+        workOrderId: req.workOrderId,
+        custPath: req.custPath,
       });
-      timingsMs.prep = clock.nowMs() - tPrep0;
+      note(`Prep: prepared ${prepared.length} file(s) in ${clock.nowMs() - tPrep0}ms.`);
+
+      if (!prepared.length) {
+        return {
+          status: "success",
+          finalStage: UploadStage.Done,
+          notes,
+          message: "No files to upload after prep (nothing planned).",
+          remoteSheetId: req.remoteSheetId ?? null,
+        };
+      }
+
+      // Optional batching (mirrors your real “batching” capability, but still minimal)
+      const batchSize = clampInt(req.batchSizeHint ?? prepared.length, 1, prepared.length);
+      const batches = chunk(prepared, batchSize);
+      if (batches.length > 1) {
+        note(`Batching: ${prepared.length} file(s) split into ${batches.length} batch(es) of ~${batchSize}.`);
+      }
 
       // ----------------------
-      // 3) Start batch (server returns SAS URLs and recommended parallelism)
+      // 3-6) For each batch: Start -> Upload -> Finalize -> Enqueue
       // ----------------------
-      stage = UploadStage.Start;
-      input.onStage?.(stage);
+      for (let i = 0; i < batches.length; i++) {
+        assertNotAborted(signal);
 
-      const tStart0 = clock.nowMs();
-      const startRes = await this.deps.api.startBlobBatch({
-        workOrderId: input.workOrderId,
-        batchId: input.batchId,
-        testPrefix: input.testPrefix,
-        custPath: input.custPath,
+        const batchFiles = batches[i];
+        note(`Batch ${i + 1}/${batches.length}: ${batchFiles.length} file(s).`);
 
-        workOrderFolderId: input.workOrderFolderId,
-        pdfFolderId: input.pdfFolderId,
-        imagesFolderId: input.imagesFolderId,
+        // 3) StartBlobBatch
+        stage = UploadStage.StartBatch;
+        setStage(stage);
 
-        clientParallelism: input.clientParallelismHint ?? 8,
-        files: prepared.map(f => ({
-          name: f.name,
-          type: f.type,
-          sizeBytes: f.sizeBytes,
-          contentType: f.contentType,
-        })),
-      });
-      timingsMs.start = clock.nowMs() - tStart0;
+        const startRes = unwrapApi(
+          await this.deps.api.startBlobBatch({
+            workOrderId: req.workOrderId,
+            batchId: req.batchId,
+            testPrefix: req.testPrefix,
+            custPath: req.custPath,
 
-      plannedCount = startRes.files.length;
+            workOrderFolderId: req.workOrderFolderId,
+            pdfFolderId: req.pdfFolderId,
+            imagesFolderId: req.imagesFolderId,
 
-      // quick sanity check
-      if (!plannedCount) {
-        throw new UploadError(
+            clientParallelism: req.clientParallelismHint ?? 8,
+            files: batchFiles.map(f => ({
+              name: f.name,
+              type: f.type,
+              sizeBytes: f.sizeBytes,
+              contentType: f.contentType,
+            })),
+          }),
           UploadErrorCode.StartFailed,
-          "StartBlobBatch returned zero planned files."
+          "StartBlobBatch"
         );
-      }
 
-      // ----------------------
-      // 4) Upload (bounded parallelism)
-      // ----------------------
-      stage = UploadStage.Upload;
-      input.onStage?.(stage);
+        if (!startRes.files?.length) {
+          throw new UploadError(UploadErrorCode.StartFailed, "StartBlobBatch returned zero planned files.");
+        }
 
-      const tUp0 = clock.nowMs();
+        const recommended = startRes.recommendedParallelism ?? (req.clientParallelismHint ?? 8);
+        const parallelism = clampInt(recommended, 1, 16);
+        note(`StartBlobBatch: planned ${startRes.files.length} file(s), parallelism=${parallelism}.`);
 
-      const recommended = startRes.recommendedParallelism ?? (input.clientParallelismHint ?? 8);
-      const parallelism = clampInt(recommended, 1, 16); // keep it sane in the “architecture doc” world
+        // 4) Upload via SAS
+        stage = UploadStage.Upload;
+        setStage(stage);
 
-      // Build plan lookup by filename
-      const planByName = new Map(startRes.files.map(p => [p.name, p]));
+        const planByName = new Map(startRes.files.map(p => [p.name, p]));
 
-      // Upload all prepared files that the server planned for
-      // If your real system allows “server filters”, you’d align on the intersection set here.
-      await this.deps.uploader.uploadMany({
-        parallelism,
-        files: prepared.map(f => {
-          const plan = planByName.get(f.name);
-          if (!plan) {
-            // Not fatal in theory, but you probably want it fatal in practice.
-            // We’ll be strict here to keep the artifact honest.
-            throw new UploadError(
-              UploadErrorCode.MissingUploadPlan,
-              `Missing SAS plan for file: ${f.name}`
+        const tUp0 = clock.nowMs();
+        await runLimited(
+          batchFiles.map(file => async () => {
+            assertNotAborted(signal);
+
+            const plan = planByName.get(file.name);
+            if (!plan) {
+              throw new UploadError(
+                UploadErrorCode.MissingUploadPlan,
+                `Missing SAS plan for file: ${file.name}`
+              );
+            }
+
+            await uploadWithRetry(
+              () =>
+                this.deps.uploader.uploadToSasUrl(
+                  {
+                    localPath: file.path,
+                    fileName: file.name,
+                    sasUrl: plan.sasUrl,
+                    contentType: plan.contentType ?? file.contentType ?? "application/octet-stream",
+                  },
+                  { signal }
+                ),
+              {
+                attempts: 3,
+                baseDelayMs: 350,
+                clock: this.deps.clock,
+                onRetry: (attempt, err) =>
+                  note(`Retry ${attempt}/3 for ${file.name} (${err?.message ?? "unknown error"})`),
+              }
             );
-          }
-          return {
-            file: f,
-            sasUrl: plan.sasUrl,
-            blobPath: plan.blobPath,
-            container: plan.container,
-            contentType: plan.contentType ?? f.contentType,
-          };
-        }),
-      });
+          }),
+          parallelism,
+          signal
+        );
+        note(`Upload: completed in ${clock.nowMs() - tUp0}ms.`);
 
-      timingsMs.upload = clock.nowMs() - tUp0;
-      uploadedCount = plannedCount;
+        // 5) FinalizeBlobBatch
+        stage = UploadStage.Finalize;
+        setStage(stage);
 
-      // ----------------------
-      // 5) Finalize (server verifies presence/casing)
-      // ----------------------
-      stage = UploadStage.Finalize;
-      input.onStage?.(stage);
-
-      const tFin0 = clock.nowMs();
-      const finRes = await this.deps.api.finalizeBlobBatch({
-        workOrderId: input.workOrderId,
-        batchId: startRes.batchId,
-        files: startRes.files.map(f => ({
-          name: f.name,
-          container: f.container,
-          blobPath: f.blobPath,
-        })),
-      });
-      timingsMs.finalize = clock.nowMs() - tFin0;
-
-      if (!finRes.finalizeOk) {
-        throw new UploadError(
+        const finRes = unwrapApi(
+          await this.deps.api.finalizeBlobBatch({
+            workOrderId: req.workOrderId,
+            batchId: startRes.batchId,
+            files: startRes.files.map(f => ({
+              name: f.name,
+              container: f.container,
+              blobPath: f.blobPath,
+            })),
+          }),
           UploadErrorCode.FinalizeFailed,
-          `Finalize failed: uploadedOk=${finRes.uploadedOk}/${finRes.plannedCount}`
+          "FinalizeBlobBatch"
         );
-      }
-      if (finRes.uploadedFailed?.length) {
-        throw new UploadError(
-          UploadErrorCode.FinalizeMismatch,
-          `Finalize mismatch: failed=${JSON.stringify(finRes.uploadedFailed)}`
+
+        if (!finRes.finalizeOk) {
+          throw new UploadError(
+            UploadErrorCode.FinalizeFailed,
+            `Finalize failed: uploadedOk=${finRes.uploadedOk}/${finRes.plannedCount}`
+          );
+        }
+        if (finRes.uploadedFailed?.length) {
+          throw new UploadError(
+            UploadErrorCode.FinalizeMismatch,
+            `Finalize mismatch: failed=${JSON.stringify(finRes.uploadedFailed)}`
+          );
+        }
+
+        // 6) Enqueue post-processing
+        stage = UploadStage.EnqueuePostProcessing;
+        setStage(stage);
+
+        unwrapApi(
+          await this.deps.api.enqueueBlobPostProcessing({
+            workOrderId: req.workOrderId,
+            batchId: startRes.batchId,
+            testPrefix: req.testPrefix,
+
+            workOrderFolderId: req.workOrderFolderId,
+            pdfFolderId: req.pdfFolderId,
+            imagesFolderId: req.imagesFolderId,
+
+            files: startRes.files.map(f => ({
+              name: f.name,
+              container: f.container,
+              blobPath: f.blobPath,
+              contentType: f.contentType,
+            })),
+          }),
+          UploadErrorCode.EnqueueFailed,
+          "EnqueueBlobPostProcessing"
         );
+
+        note(`Batch ${i + 1}/${batches.length}: complete.`);
       }
 
-      // ----------------------
-      // 6) Enqueue post-processing (Drive sync, receipts parse, email)
-      // ----------------------
-      stage = UploadStage.Enqueue;
-      input.onStage?.(stage);
-
-      const tEq0 = clock.nowMs();
-      await this.deps.api.enqueueBlobPostProcessing({
-        workOrderId: input.workOrderId,
-        batchId: startRes.batchId,
-        testPrefix: input.testPrefix,
-
-        workOrderFolderId: input.workOrderFolderId,
-        pdfFolderId: input.pdfFolderId,
-        imagesFolderId: input.imagesFolderId,
-
-        files: startRes.files.map(f => ({
-          name: f.name,
-          container: f.container,
-          blobPath: f.blobPath,
-          contentType: f.contentType,
-        })),
-      });
-      timingsMs.enqueue = clock.nowMs() - tEq0;
-
-      stage = UploadStage.Complete;
-      input.onStage?.(stage);
+      stage = UploadStage.Done;
+      setStage(stage);
 
       return {
-        ok: true,
-        stage,
-        startedAtMs,
-        finishedAtMs: clock.nowMs(),
-        timingsMs,
-        counts: { scanned: scanned.length, planned: plannedCount, uploaded: uploadedCount },
-        warnings,
+        status: "success",
+        finalStage: stage,
+        notes,
+        message: `Upload complete (${clock.nowMs() - startedAtMs}ms).`,
+        remoteSheetId: req.remoteSheetId ?? null,
       };
     } catch (err: any) {
       const finishedAtMs = clock.nowMs();
 
-      // Normalize error into our domain model.
+      if (signal?.aborted) {
+        return {
+          status: "cancelled",
+          finalStage: UploadStage.Error,
+          notes,
+          message: `Cancelled (${finishedAtMs - startedAtMs}ms).`,
+          remoteSheetId: req.remoteSheetId ?? null,
+        };
+      }
+
       const e =
         err instanceof UploadError
           ? err
@@ -316,32 +364,115 @@ export class UploadOrchestrator {
               { cause: err }
             );
 
-      this.deps.logger.error("[UploadOrchestrator] Failed", {
+      logger.error("[UploadOrchestrator] Failed", {
+        ...logBase,
         stage,
         code: e.code,
         message: e.message,
         meta: e.meta,
-        workOrderId: input.workOrderId,
-        batchId: input.batchId,
-        remoteSheetId: input.remoteSheetId,
-        localSheetId: input.localSheetId,
       });
 
       return {
-        ok: false,
-        stage,
-        startedAtMs,
-        finishedAtMs,
-        timingsMs,
-        counts: { scanned: scanned.length, planned: plannedCount, uploaded: uploadedCount },
-        warnings,
+        status: "failure",
+        finalStage: UploadStage.Error,
+        error: e,
+        notes,
+        message: `Upload failed at stage=${String(stage)} (${e.code}).`,
+        remoteSheetId: req.remoteSheetId ?? null,
       };
     }
   }
+}
+
+/* ---------------------------------- helpers ---------------------------------- */
+
+function unwrapApi<T>(res: ApiResult<T>, code: string, label: string): T {
+  if (res.ok) return res.data;
+  throw new UploadError(code, `${label} failed: ${res.message}`, { details: res.details });
+}
+
+function assertNotAborted(signal?: AbortSignal) {
+  if (signal?.aborted) {
+    throw new UploadError(UploadErrorCode.Cancelled, "Operation cancelled.");
+  }
+}
+
+async function uploadWithRetry(
+  fn: () => Promise<void>,
+  opts: {
+    attempts: number;
+    baseDelayMs: number;
+    clock: ClockPort;
+    onRetry?: (attempt: number, err: any) => void;
+  }
+) {
+  let lastErr: any;
+  for (let attempt = 1; attempt <= opts.attempts; attempt++) {
+    try {
+      await fn();
+      return;
+    } catch (e: any) {
+      lastErr = e;
+      if (attempt >= opts.attempts) break;
+
+      opts.onRetry?.(attempt + 1, e);
+      const delay = opts.baseDelayMs * attempt;
+      await opts.clock.sleep(delay);
+    }
+  }
+  throw new UploadError(
+    UploadErrorCode.UploadFailed,
+    lastErr?.message ?? "Upload failed after retries.",
+    { cause: lastErr }
+  );
+}
+
+/** Bounded concurrency runner (no deps) */
+async function runLimited(
+  tasks: Array<() => Promise<void>>,
+  parallelism: number,
+  signal?: AbortSignal
+): Promise<void> {
+  assertNotAborted(signal);
+
+  const limit = clampInt(parallelism, 1, 64);
+  let next = 0;
+  let firstErr: any = null;
+
+  async function worker() {
+    while (true) {
+      assertNotAborted(signal);
+
+      const idx = next++;
+      if (idx >= tasks.length) return;
+
+      try {
+        await tasks[idx]();
+      } catch (e: any) {
+        firstErr = firstErr ?? e;
+        return;
+      }
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(limit, tasks.length) }, () => worker());
+  await Promise.all(workers);
+
+  if (signal?.aborted) {
+    throw new UploadError(UploadErrorCode.Cancelled, "Operation cancelled.");
+  }
+  if (firstErr) throw firstErr;
 }
 
 /** tiny helper: avoid “parallelism = 9000” from accidental values */
 function clampInt(n: number, min: number, max: number): number {
   const x = Number.isFinite(n) ? Math.floor(n) : min;
   return Math.max(min, Math.min(max, x));
+}
+
+function chunk<T>(items: T[], size: number): T[][] {
+  if (size <= 0) return [items];
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
 }
