@@ -108,7 +108,7 @@ export class UploadOrchestrator {
     const timingsMs: Record<string, number> = {};
     const warnings: string[] = [];
 
-    let stage: UploadStage = "Init";
+    let stage: UploadStage = UploadStage.Init;
     input.onStage?.(stage);
 
     let scanned: UploadFile[] = [];
@@ -119,7 +119,7 @@ export class UploadOrchestrator {
       // ----------------------
       // 1) Scan
       // ----------------------
-      stage = "Scan";
+      stage = UploadStage.Scan;
       input.onStage?.(stage);
 
       const tScan0 = clock.nowMs();
@@ -146,7 +146,7 @@ export class UploadOrchestrator {
       // ----------------------
       // 2) Prep (normalize/compress/etc in real impl)
       // ----------------------
-      stage = "Prep";
+      stage = UploadStage.Prep;
       input.onStage?.(stage);
 
       const tPrep0 = clock.nowMs();
@@ -160,7 +160,7 @@ export class UploadOrchestrator {
       // ----------------------
       // 3) Start batch (server returns SAS URLs and recommended parallelism)
       // ----------------------
-      stage = "Start";
+      stage = UploadStage.Start;
       input.onStage?.(stage);
 
       const tStart0 = clock.nowMs();
@@ -197,7 +197,7 @@ export class UploadOrchestrator {
       // ----------------------
       // 4) Upload (bounded parallelism)
       // ----------------------
-      stage = "Upload";
+      stage = UploadStage.Upload;
       input.onStage?.(stage);
 
       const tUp0 = clock.nowMs();
@@ -238,7 +238,7 @@ export class UploadOrchestrator {
       // ----------------------
       // 5) Finalize (server verifies presence/casing)
       // ----------------------
-      stage = "Finalize";
+      stage = UploadStage.Finalize;
       input.onStage?.(stage);
 
       const tFin0 = clock.nowMs();
@@ -269,7 +269,7 @@ export class UploadOrchestrator {
       // ----------------------
       // 6) Enqueue post-processing (Drive sync, receipts parse, email)
       // ----------------------
-      stage = "Enqueue";
+      stage = UploadStage.Enqueue;
       input.onStage?.(stage);
 
       const tEq0 = clock.nowMs();
@@ -291,7 +291,7 @@ export class UploadOrchestrator {
       });
       timingsMs.enqueue = clock.nowMs() - tEq0;
 
-      stage = "Complete";
+      stage = UploadStage.Complete;
       input.onStage?.(stage);
 
       return {
