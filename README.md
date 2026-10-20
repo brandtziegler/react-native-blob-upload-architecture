@@ -1,5 +1,7 @@
 # React Native → Azure Blob (SAS) Upload Architecture (Non-Runnable)
 
+> **Where this comes from:** extracted from **TaskFuel**, a work-order and invoicing platform for truck repair shops that I designed and built (ASP.NET Core, SQL Server, Azure, React Native). The full codebase is private; this repo shows the architecture.
+
 This repository is a **public architecture showcase** extracted from a private production codebase.
 
 It demonstrates a staged “direct-to-Blob” batch upload flow from a React Native client:
